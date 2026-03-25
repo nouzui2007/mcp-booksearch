@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import express from "express";
 import { z } from "zod";
 
 const SearchBooksInputSchema = z.object({
@@ -100,78 +101,86 @@ async function searchBooks(query: string, maxResults: number): Promise<string> {
   return lines.join("\n").trimEnd();
 }
 
-const server = new Server(
-  {
-    name: "google-books",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+function createServer(): Server {
+  const server = new Server(
+    { name: "google-books", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "search_books",
-      description:
-        "Google Books APIを使って書籍を検索します。ISBNを含む書籍リストを返します。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "自然言語の検索クエリ（例：「Pythonの入門書」）",
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "search_books",
+        description:
+          "Google Books APIを使って書籍を検索します。ISBNを含む書籍リストを返します。",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "自然言語の検索クエリ（例：「Pythonの入門書」）",
+            },
+            maxResults: {
+              type: "number",
+              description: "取得件数（1〜40、デフォルト10）",
+              minimum: 1,
+              maximum: 40,
+              default: 10,
+            },
           },
-          maxResults: {
-            type: "number",
-            description: "取得件数（1〜40、デフォルト10）",
-            minimum: 1,
-            maximum: 40,
-            default: 10,
-          },
+          required: ["query"],
         },
-        required: ["query"],
       },
-    },
-  ],
-}));
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "search_books") {
-    return {
-      content: [{ type: "text", text: `不明なツール: ${request.params.name}` }],
-      isError: true,
-    };
-  }
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== "search_books") {
+      return {
+        content: [{ type: "text", text: `不明なツール: ${request.params.name}` }],
+        isError: true,
+      };
+    }
 
-  const parsed = SearchBooksInputSchema.safeParse(request.params.arguments);
-  if (!parsed.success) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `入力エラー: ${parsed.error.message}`,
-        },
-      ],
-      isError: true,
-    };
-  }
+    const parsed = SearchBooksInputSchema.safeParse(request.params.arguments);
+    if (!parsed.success) {
+      return {
+        content: [{ type: "text", text: `入力エラー: ${parsed.error.message}` }],
+        isError: true,
+      };
+    }
 
-  const { query, maxResults } = parsed.data;
-  const result = await searchBooks(query, maxResults);
+    const { query, maxResults } = parsed.data;
+    const result = await searchBooks(query, maxResults);
+    return { content: [{ type: "text", text: result }] };
+  });
 
-  return {
-    content: [{ type: "text", text: result }],
-  };
-});
+  return server;
+}
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Google Books MCP server started");
+  const app = express();
+  app.use(express.json());
+  const PORT = parseInt(process.env.PORT ?? "8080", 10);
+
+  // App Runner ヘルスチェック用
+  app.get("/health", (_req, res) => {
+    res.status(200).json({ status: "ok" });
+  });
+
+  // MCPエンドポイント（ステートレスモード：リクエストごとに新インスタンス）
+  app.all("/mcp", async (req, res) => {
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.error(`Google Books MCP server listening on port ${PORT}`);
+  });
 }
 
 main().catch((err) => {
